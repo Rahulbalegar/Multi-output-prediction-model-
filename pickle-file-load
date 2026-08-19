@@ -1,0 +1,523 @@
+"""
+=============================================================================
+CONCRETE STRENGTH PREDICTION — FIGURE GENERATION SCRIPT v3
+=============================================================================
+"""
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import pickle
+import numpy as np
+import pandas as pd
+from scipy.stats import gaussian_kde
+from scipy.spatial.distance import jensenshannon
+
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import FancyBboxPatch
+
+import shap
+
+# =============================================================================
+# FIGURE STYLE CONFIG
+# =============================================================================
+
+PICKLE_FILE = "concrete_model.pkl"
+
+FONT_FAMILY     = 'DejaVu Sans'
+FONT_SIZE_BASE  = 11
+FONT_SIZE_AXIS  = 12
+FONT_SIZE_TITLE = 13
+FONT_SIZE_SUPTITLE = 14
+FONT_SIZE_ANNOT = 11
+FONT_SIZE_BAR   = 12
+
+# Model comparison — larger fonts
+MC_FONT_AXIS    = 14
+MC_FONT_LEGEND  = 13
+MC_FONT_TICK    = 12
+
+FIG_SINGLE    = (4, 4)
+FIG_2x2       = (12, 9)
+FIG_BAR_H     = (8, 6)
+FIG_SMALL     = (5, 4)       # VIF and Pearson
+FIG_CORR      = (12, 10)
+FIG_MODEL_CMP = (13, 6)
+FIG_FLOW      = (10, 13)
+FIG_BEESWARM  = (14, 10)     # 4-panel beeswarm (2x2)
+
+C_REAL   = '#1F3864'
+C_SYNTH  = '#E65100'
+C_BEST   = '#2E7D32'
+C_ACTUAL = '#1F3864'
+
+AGE_COLORS = ['#1F3864', '#1565C0', '#2E7D32', '#E65100']
+
+LEGEND_LOC  = 'best'
+LEGEND_NCOL = 1
+
+SAVE_DPI    = 300
+SAVE_FORMAT = 'png'
+SAVE_DIR    = './'
+
+AGE_LABELS_DISPLAY = {
+    "f'c 7d":  "7 days",
+    "f'c 28d": "28 days",
+    "f'c 56d": "56 days",
+    "f'c 90d": "90 days",
+}
+
+XAXIS_LABELS = {
+    'D10':               'D10 (μm)',
+    'D50':               'D50 (μm)',
+    'D90':               'D90 (μm)',
+    'Amorphous content': 'Amorphous content (%)',
+    'Heat Release':      'Heat release (J/g)',
+    'Bound Water':       'Bound water (g/100g paste)',
+    'CH Consumption':    'CH consumption (g/100g SCM)',
+    'W/C Ratio':         'w/c ratio',
+    "f'c 7d":            "f'c 7d (MPa)",
+    "f'c 28d":           "f'c 28d (MPa)",
+    "f'c 56d":           "f'c 56d (MPa)",
+    "f'c 90d":           "f'c 90d (MPa)",
+}
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+import os
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+def savefig(fig, name):
+    if SAVE_DPI:
+        path = os.path.join(SAVE_DIR, f"{name}.{SAVE_FORMAT}")
+        fig.savefig(path, dpi=SAVE_DPI, bbox_inches='tight')
+        print(f"  Saved: {path}")
+    plt.show()
+    plt.close(fig)
+
+def add_border(ax):
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(1.0)
+        spine.set_color('black')
+
+# No bold anywhere — set weight globally
+plt.rcParams.update({
+    'font.family':        FONT_FAMILY,
+    'font.weight':        'normal',
+    'font.size':          FONT_SIZE_BASE,
+    'axes.titlesize':     FONT_SIZE_TITLE,
+    'axes.titleweight':   'normal',
+    'axes.labelsize':     FONT_SIZE_AXIS,
+    'axes.labelweight':   'normal',
+    'xtick.labelsize':    FONT_SIZE_BASE,
+    'ytick.labelsize':    FONT_SIZE_BASE,
+    'legend.fontsize':    FONT_SIZE_BASE,
+    'axes.grid':          False,
+    'axes.spines.top':    True,
+    'axes.spines.right':  True,
+    'mathtext.default':   'regular',
+})
+
+# =============================================================================
+# LOAD PICKLE
+# =============================================================================
+print(f"Loading {PICKLE_FILE}...")
+with open(PICKLE_FILE, 'rb') as f:
+    D = pickle.load(f)
+
+train_raw        = D['train_raw']
+synthetic        = D['synthetic']
+combined         = D['combined']
+X_train          = D['X_train']
+Y_train          = D['Y_train']
+X_test           = D['X_test']
+Y_test           = D['Y_test']
+FEATURES         = D['FEATURES']
+TARGETS          = D['TARGETS']
+CONTINUOUS       = D['CONTINUOUS']
+SCM_COLS         = D['SCM_COLS']
+results_all      = D['results_all']
+preds_all        = D['preds_all']
+fitted_all       = D['fitted_all']
+ranked           = D['ranked']
+best_name        = D['best_name']
+best_model       = D['best_model']
+best_preds       = D['best_preds']
+shapiro_results  = D['shapiro_results']
+dist_method      = D['dist_method']
+cont_bounds      = D['cont_bounds']
+vif_results      = D['vif_results']
+shap_values_all  = D['shap_values_all']
+shap_X           = D['shap_X']
+shap_imp_overall = D['shap_importance_overall']
+shap_imp_per     = D['shap_importance_per_target']
+
+print(f"  Best model: {best_name}")
+print(f"  R² avg:     {ranked[0][1]['R2_mean']:.4f}\n")
+
+# =============================================================================
+# FIGURE 1 — Flowchart
+# =============================================================================
+print("Figure 1: Flowchart")
+fig, ax = plt.subplots(figsize=FIG_FLOW)
+ax.set_xlim(0, 10); ax.set_ylim(0, 13); ax.axis('off')
+
+def fbox(ax, x, y, w, h, txt, color):
+    ax.add_patch(FancyBboxPatch((x-w/2, y-h/2), w, h, boxstyle='round,pad=0.1',
+                                linewidth=1.2, edgecolor='#37474F', facecolor=color, zorder=3))
+    ax.text(x, y, txt, ha='center', va='center', fontsize=FONT_SIZE_TITLE,
+            fontweight='normal', color='white', zorder=4, multialignment='center')
+
+def farrow(ax, x1, y1, x2, y2, color='#37474F', rad=0.0):
+    ax.annotate('', xy=(x2, y2), xytext=(x1, y1),
+                arrowprops=dict(arrowstyle='->', color=color, lw=1.5,
+                                connectionstyle=f'arc3,rad={rad}'))
+
+steps_up = [
+    (12.2, '#1F3864', 'DATA COLLECTION\n26 Experimental Samples\n(Reactivity metrics + Compressive strength)'),
+    (11.0, '#1565C0', 'DISTRIBUTION ANALYSIS\nShapiro-Wilk per feature → KDE or Truncated-Normal'),
+    (9.8,  '#1565C0', 'MONTE CARLO AUGMENTATION\n260 Synthetic Samples | Ternary constraint enforced\nMultivariate KDE for targets'),
+    (8.6,  '#1565C0', 'PHYSICAL PLAUSIBILITY VALIDATION\nBlend sums | Feature bounds | Convex hull | Temporal ordering'),
+    (7.4,  '#0D47A1', 'COMBINED TRAINING SET  (286 samples)\n26 real + 260 synthetic  |  6 real samples held out'),
+    (6.2,  '#2E7D32', 'ALL 10 MODELS — GridSearchCV (5-Fold CV)\nMultivariate output — all 4 ages predicted jointly'),
+]
+for y, color, txt in steps_up:
+    fbox(ax, 5, y, 7.5, 0.7, txt, color)
+
+pts = [[5, 5.0+0.45], [5+1.6, 5.0], [5, 5.0-0.45], [5-1.6, 5.0]]
+ax.add_patch(plt.Polygon(pts, closed=True, facecolor='#FF8F00',
+                          edgecolor='#37474F', lw=1.2, zorder=3))
+ax.text(5, 5.0, 'Performance\nSatisfactory?', ha='center', va='center',
+        fontsize=FONT_SIZE_TITLE, fontweight='normal', color='white', zorder=4, multialignment='center')
+ax.text(6.8, 4.9, 'Yes',          fontsize=FONT_SIZE_TITLE+2, color='#2E7D32')
+ax.text(3.1, 4.6, 'No → Refine', fontsize=FONT_SIZE_TITLE+2, color='#C62828')
+
+steps_dn = [
+    (4.0, '#2E7D32', 'TEST SET EVALUATION\n6 Real Held-Out Samples | R², MAE, RMSE per age'),
+    (2.8, '#4A148C', 'INTERPRETABILITY\nSHAP | VIF | Pearson | Prediction Intervals'),
+    (1.6, '#B71C1C', 'EXTERNAL VALIDATION\n4 New Cast Mixtures (never seen by model)'),
+]
+for y, color, txt in steps_dn:
+    fbox(ax, 5, y, 7.5, 0.7, txt, color)
+
+ys_up = [s[0] for s in steps_up]
+for i in range(len(ys_up)-1):
+    farrow(ax, 5, ys_up[i]-0.35, 5, ys_up[i+1]+0.35)
+farrow(ax, 5, 6.2-0.35, 5, 5.0+0.45)
+farrow(ax, 6.6, 5.0, 5+3.75/2, 4.0+0.35)
+for y1, y2 in [(4.0, 2.8), (2.8, 1.6)]:
+    farrow(ax, 5, y1-0.35, 5, y2+0.35)
+ax.annotate('', xy=(5, 6.55), xytext=(3.1, 5.0),
+            arrowprops=dict(arrowstyle='->', color='#C62828', lw=1.5,
+                            connectionstyle='arc3,rad=-0.3'))
+
+plt.tight_layout()
+savefig(fig, 'fig01_flowchart')
+
+# =============================================================================
+# FIGURE 2 — KDE distributions
+# =============================================================================
+print("Figure 2: KDE distributions")
+plot_cols = CONTINUOUS + TARGETS
+for col in plot_cols:
+    real  = train_raw[col].values
+    synth = synthetic[col].values
+    xlo   = min(real.min(), synth.min())
+    xhi   = max(real.max(), synth.max())
+    xs    = np.linspace(xlo - 0.05*(xhi-xlo), xhi + 0.05*(xhi-xlo), 300)
+    kr    = gaussian_kde(real,  bw_method='silverman')
+    ks    = gaussian_kde(synth, bw_method='silverman')
+    bins  = np.linspace(xlo, xhi, 50)
+    p, _  = np.histogram(real,  bins=bins, density=True); p += 1e-10
+    q, _  = np.histogram(synth, bins=bins, density=True); q += 1e-10
+    jsd   = jensenshannon(p, q) ** 2
+
+    fig, ax = plt.subplots(figsize=FIG_SINGLE)
+    ax.fill_between(xs, kr(xs), alpha=0.2, color=C_REAL)
+    ax.fill_between(xs, ks(xs), alpha=0.2, color=C_SYNTH)
+    ax.plot(xs, kr(xs), color=C_REAL,  lw=2, label='Experimental')
+    ax.plot(xs, ks(xs), color=C_SYNTH, lw=2, label='Synthetic')
+    ax.text(0.04, 0.96, f'JSD = {jsd:.2f}',
+            transform=ax.transAxes, fontsize=FONT_SIZE_ANNOT,
+            va='top', ha='left',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8, edgecolor='none'))
+    ax.set_xlabel(XAXIS_LABELS.get(col, col), fontsize=FONT_SIZE_AXIS)
+    ax.set_ylabel('Density', fontsize=FONT_SIZE_AXIS)
+    ax.set_title('')
+    ax.legend(loc=LEGEND_LOC, ncol=LEGEND_NCOL)
+    add_border(ax)
+    ax.grid(False)
+    plt.tight_layout()
+    safe = col.replace(' ', '_').replace('/', '').replace("'", '')
+    savefig(fig, f'fig02_kde_{safe}')
+
+# =============================================================================
+# FIGURE 3 — Learning curves: SKIPPED
+# FIGURE 7 — Correlation heatmap: SKIPPED
+# FIGURE 9 — SHAP per-age individual: SKIPPED
+# FIGURE 11 — Prediction intervals: SKIPPED
+# =============================================================================
+print("Figure 3: Learning curves — SKIPPED")
+print("Figure 7: Correlation heatmap — SKIPPED")
+print("Figure 9: Per-age SHAP individual — SKIPPED")
+print("Figure 11: Prediction intervals — SKIPPED")
+
+# =============================================================================
+# FIGURE 4 — Actual vs Predicted
+# =============================================================================
+print("Figure 4: Actual vs predicted")
+for ti, tlbl in enumerate(TARGETS):
+    actual = Y_test[:, ti]
+    pred   = best_preds[:, ti]
+    mn     = min(actual.min(), pred.min()) * 0.90
+    mx     = max(actual.max(), pred.max()) * 1.10
+
+    fig, ax = plt.subplots(figsize=FIG_SINGLE)
+    ax.scatter(actual, pred, s=100, color=C_BEST, edgecolors='white', lw=1.2, zorder=3)
+    ax.plot([mn, mx], [mn, mx], 'r--', lw=1.5)
+    ax.fill_between([mn, mx], [mn*0.9, mx*0.9], [mn*1.1, mx*1.1], alpha=0.07, color='red')
+    for si in range(len(actual)):
+        ax.annotate(f'S{si+1}', (actual[si], pred[si]),
+                    textcoords='offset points', xytext=(5, 4), fontsize=FONT_SIZE_ANNOT)
+    r2_v   = results_all[best_name]['R2'][ti]
+    mae_v  = results_all[best_name]['MAE'][ti]
+    rmse_v = results_all[best_name]['RMSE'][ti]
+    ax.text(0.97, 0.05, f'R²={r2_v:.3f}\nMAE={mae_v:.3f}\nRMSE={rmse_v:.3f}',
+            transform=ax.transAxes, fontsize=FONT_SIZE_ANNOT, va='bottom', ha='right',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8, edgecolor='none'))
+    ax.text(0.05, 0.95, AGE_LABELS_DISPLAY[tlbl],
+            transform=ax.transAxes, fontsize=FONT_SIZE_TITLE, va='top', ha='left',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8, edgecolor='none'))
+    ax.set_xlim(mn, mx); ax.set_ylim(mn, mx)
+    ax.set_xlabel('Actual compressive strength (MPa)',    fontsize=FONT_SIZE_AXIS)
+    ax.set_ylabel('Predicted compressive strength (MPa)', fontsize=FONT_SIZE_AXIS)
+    ax.set_title('')
+    ax.set_aspect('equal', 'box')
+    add_border(ax)
+    ax.grid(False)
+    plt.tight_layout()
+    safe = tlbl.replace("'", "").replace(' ', '_')
+    savefig(fig, f'fig04_scatter_{safe}')
+
+# =============================================================================
+# FIGURE 5 — Pearson correlation  (4×4 inches each)
+# =============================================================================
+print("Figure 5: Pearson correlation")
+for ti, tlbl in enumerate(TARGETS):
+    corrs  = combined[FEATURES].corrwith(combined[tlbl]).sort_values()
+    colors = ['#C62828' if v < 0 else '#1565C0' for v in corrs.values]
+
+    fig, ax = plt.subplots(figsize=FIG_SMALL)
+    bars = ax.barh(corrs.index, corrs.values, color=colors, height=0.6, edgecolor='white')
+    ax.axvline(0, color='black', lw=0.8)
+    for bar, val in zip(bars, corrs.values):
+        ax.text(val + (0.01 if val >= 0 else -0.01),
+                bar.get_y() + bar.get_height()/2,
+                f'{val:.2f}', va='center',
+                ha='left' if val >= 0 else 'right',
+                fontsize=FONT_SIZE_BAR)
+    ax.set_xlim(-1.05, 1.05)
+    ax.set_xlabel('Pearson r', fontsize=FONT_SIZE_AXIS)
+    ax.tick_params(axis='both', labelsize=FONT_SIZE_BASE + 1)
+    ax.set_title('')
+    ax.text(0.97, 0.03, AGE_LABELS_DISPLAY[tlbl],
+            transform=ax.transAxes, fontsize=FONT_SIZE_TITLE,
+            va='bottom', ha='right',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8, edgecolor='none'))
+    plt.tight_layout()
+    safe = tlbl.replace("'", "").replace(' ', '_')
+    savefig(fig, f'fig05_pearson_{safe}')
+
+# =============================================================================
+# FIGURE 6a — SHAP overall feature importance bar chart
+# =============================================================================
+print("Figure 6a: SHAP overall importance")
+if shap_imp_overall is not None:
+    df = shap_imp_overall.sort_values('Mean_SHAP', ascending=True)
+    fig, ax = plt.subplots(figsize=FIG_BAR_H)
+    cols_bar = plt.cm.Blues(np.linspace(0.35, 0.85, len(df)))
+    ax.barh(df['Feature'], df['Mean_SHAP'], color=cols_bar, edgecolor='white', height=0.6)
+    for _, row in df.iterrows():
+        ax.text(row['Mean_SHAP'] + df['Mean_SHAP'].max()*0.01,
+                list(df['Feature']).index(row['Feature']),
+                f"{row['Mean_SHAP']:.4f}", va='center', fontsize=FONT_SIZE_BAR)
+    ax.set_xlabel('Mean |SHAP| (averaged over all ages)', fontsize=FONT_SIZE_AXIS)
+    ax.set_title('')
+    plt.tight_layout()
+    savefig(fig, 'fig06a_shap_importance')
+else:
+    print("  SHAP not available — skipping fig 6a")
+
+# =============================================================================
+# FIGURE 6b — SHAP Beeswarm: 2×2 panel, one per curing age
+# =============================================================================
+print("Figure 6b: SHAP beeswarm (mean across all 4 ages, single figure)")
+if shap_values_all is not None and shap_imp_overall is not None:
+    feat_order = shap_imp_overall.sort_values('Mean_SHAP', ascending=True)['Feature'].tolist()
+
+    # Average SHAP values across all 4 curing ages: shape [n_samples, n_features]
+    sv_mean = np.mean(np.stack(shap_values_all, axis=0), axis=0)
+
+    fig, ax = plt.subplots(figsize=FIG_BAR_H)
+
+    for fi, feat in enumerate(feat_order):
+        feat_idx = FEATURES.index(feat)
+        sv_col   = sv_mean[:, feat_idx]
+        fv       = shap_X[:, feat_idx]
+        fv_norm  = (fv - fv.min()) / (fv.max() - fv.min() + 1e-9)
+        jitter   = np.random.uniform(-0.2, 0.2, len(sv_col))
+        sc = ax.scatter(sv_col, fi + jitter, c=fv_norm,
+                        cmap='coolwarm', s=14, alpha=0.6, linewidths=0)
+
+    ax.set_yticks(range(len(feat_order)))
+    ax.set_yticklabels(feat_order, fontsize=FONT_SIZE_BASE)
+    ax.axvline(0, color='black', lw=0.8)
+    ax.set_xlabel('Mean SHAP value (averaged across 7d, 28d, 56d, 90d)', fontsize=FONT_SIZE_AXIS)
+    ax.set_title('')
+
+    cbar = plt.colorbar(sc, ax=ax, shrink=0.6)
+    cbar.set_label('Normalized feature value', fontsize=FONT_SIZE_BASE + 1)
+    cbar.ax.tick_params(labelsize=FONT_SIZE_BASE)
+
+    plt.tight_layout()
+    savefig(fig, 'fig06b_shap_beeswarm_mean')
+else:
+    print("  SHAP not available — skipping fig 6b")
+
+# =============================================================================
+# FIGURE 8 — Model comparison
+# No title; larger axis labels, tick labels, and legend
+# =============================================================================
+print("Figure 8: Model comparison")
+model_names = [n for n, _ in ranked]
+r2_matrix   = np.array([results_all[n]['R2'] for n in model_names])
+
+fig, ax = plt.subplots(figsize=FIG_MODEL_CMP)
+x = np.arange(len(model_names)); w = 0.18
+for ti, (tlbl, c) in enumerate(zip(TARGETS, AGE_COLORS)):
+    ax.bar(x + ti*w - 1.5*w, r2_matrix[:, ti], w,
+           label=tlbl, color=c, alpha=0.85, edgecolor='white')
+
+ax.set_xticks(x)
+ax.set_xticklabels(model_names, rotation=35, ha='right', fontsize=MC_FONT_TICK)
+ax.tick_params(axis='y', labelsize=MC_FONT_TICK)
+ax.set_ylabel('R²', fontsize=MC_FONT_AXIS)
+ax.set_xlabel('Model', fontsize=MC_FONT_AXIS)
+ax.set_ylim(0, 1.12)
+ax.axhline(0.70, color='gray', ls='--', lw=1, alpha=0.7, label='R²=0.70 threshold')
+ax.legend(loc=LEGEND_LOC, ncol=LEGEND_NCOL, fontsize=MC_FONT_LEGEND)
+ax.annotate('Best', xy=(0, r2_matrix[0].max()+0.01), ha='center',
+             fontsize=FONT_SIZE_ANNOT, color='#B71C1C')
+ax.set_title('')
+
+plt.tight_layout()
+savefig(fig, 'fig08_model_comparison')
+
+# =============================================================================
+# FIGURE 10 — VIF  (4×4 inches)
+# =============================================================================
+print("Figure 10: VIF")
+vif_feats  = [v[0] for v in vif_results]
+vif_vals   = [v[1] for v in vif_results]
+vif_colors = ['#2E7D32' if v < 5 else '#FF8F00' if v < 10 else '#C62828' for v in vif_vals]
+
+fig, ax = plt.subplots(figsize=FIG_SMALL)
+bars = ax.barh(vif_feats[::-1], vif_vals[::-1], color=vif_colors[::-1],
+               edgecolor='white', height=0.6)
+ax.axvline(5,  color='#FF8F00', ls='--', lw=1.5)
+ax.axvline(10, color='#C62828', ls='--', lw=1.5)
+for bar, val in zip(bars, vif_vals[::-1]):
+    ax.text(val + 0.1, bar.get_y() + bar.get_height()/2,
+            f'{val:.2f}', va='center', fontsize=FONT_SIZE_BAR)
+ax.set_xlabel('Variance Inflation Factor (VIF)', fontsize=FONT_SIZE_AXIS)
+ax.set_title('')
+ax.tick_params(axis='y', labelsize=FONT_SIZE_BASE + 1)
+ax.tick_params(axis='x', labelsize=FONT_SIZE_BASE)
+ax.legend(handles=[mpatches.Patch(color='#2E7D32', label='VIF < 5'),
+                    mpatches.Patch(color='#FF8F00', label='VIF 5–10'),
+                    mpatches.Patch(color='#C62828', label='VIF > 10')],
+          loc=LEGEND_LOC, ncol=LEGEND_NCOL)
+add_border(ax)
+ax.grid(False)
+plt.tight_layout()
+savefig(fig, 'fig10_vif')
+
+print("\nAll figures done.")
+
+# =============================================================================
+# INFERENCE
+# =============================================================================
+print("\n" + "="*60)
+print(f"INFERENCE — {best_name}")
+print("="*60)
+
+def predict_new(feature_dict):
+    x = np.array([[feature_dict.get(f, 0.0) for f in FEATURES]])
+    y = best_model.predict(x)[0]
+    return dict(zip(TARGETS, y))
+
+def run_inference_cli():
+    SCM_OPTIONS    = {'CC':'Calcined Clay','VA':'Volcanic Ash','FBC':'FBC Ash',
+                      'SC':'Slag Cement','GBA':'Ground BF Ash','FA':'Fly Ash'}
+    CEMENT_OPTIONS = {'PC':'Portland Cement','PLC':'Portland Limestone Cement'}
+
+    def get_float(prompt):
+        while True:
+            try: return float(input(prompt))
+            except ValueError: print("  Enter a number.")
+
+    mix_num = 1
+    while True:
+        print(f"\n--- Mixture {mix_num} ---")
+        label = input("Mixture label (or 'done' to finish): ").strip()
+        if label.lower() == 'done':
+            break
+
+        print("\nCement type: " + "  |  ".join(f"{k} = {v}" for k,v in CEMENT_OPTIONS.items()))
+        while True:
+            ct = input("Enter PC or PLC: ").strip().upper()
+            if ct in CEMENT_OPTIONS: break
+            print("  Enter PC or PLC.")
+        cp = get_float(f"  {ct} proportion (%): ")
+
+        gp = get_float("\nGP proportion (%): ")
+
+        print("\nSCM: " + "  |  ".join(f"{k} = {v}" for k,v in SCM_OPTIONS.items()))
+        while True:
+            st = input("Enter SCM code: ").strip().upper()
+            if st in SCM_OPTIONS: break
+            print("  Not recognised.")
+        sp = get_float(f"  {st} proportion (%): ")
+
+        total = cp + gp + sp
+        print(f"  Blend total: {total:.1f}%" + ("  should sum to 100%" if abs(total-100)>1 else ""))
+
+        fd = {}
+        fd[ct]                 = cp
+        fd['GP']               = gp
+        fd[st]                 = sp
+        fd['W/C Ratio']        = get_float("\nW/C ratio: ")
+        fd['D10']              = get_float("D10 (μm): ")
+        fd['D50']              = get_float("D50 (μm): ")
+        fd['D90']              = get_float("D90 (μm): ")
+        fd['Amorphous content']= get_float("Amorphous content (%): ")
+        fd['Heat Release']     = get_float("Heat release (J/g): ")
+        fd['Bound Water']      = get_float("Bound water (g/100g paste): ")
+        fd['CH Consumption']   = get_float("CH consumption (g/100g SCM): ")
+
+        preds = predict_new(fd)
+
+        print(f"\nPredictions for '{label}':")
+        print(f"  {'Age':<12}  {'Predicted (MPa)':>16}")
+        print(f"  {'-'*32}")
+        for age, val in preds.items():
+            print(f"  {age:<12}  {val:>16.2f}")
+
+        mix_num += 1
+    print("\nInference complete.")
+
+run_inference_cli()
